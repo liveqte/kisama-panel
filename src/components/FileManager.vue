@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, type Ref } from 'vue'
 import { AgentClient } from '../lib/agent-client'
+import { getUploadChunkSize, withRawChunkRetry } from '../lib/upload-chunk'
 import type { AgentNode } from '../types'
 import DialogModal from './DialogModal.vue'
 import FileViewer from './FileViewer.vue'
@@ -517,15 +518,7 @@ async function handleUpload(e: Event) {
   const file = input.files?.[0]
   if (!file) return
 
-  let CHUNK_SIZE = 2 * 1024 * 1024; 
-  try {
-    const proxyRaw = localStorage.getItem('kisama_proxy_config');
-    if (proxyRaw && JSON.parse(proxyRaw).enabled) {
-      CHUNK_SIZE = 512 * 1024; 
-    }
-  } catch (err) {
-    console.error(err);
-  }
+  const CHUNK_SIZE = getUploadChunkSize();
 
   try {
     loading.value = true 
@@ -579,14 +572,17 @@ async function handleUpload(e: Event) {
         const startTime = performance.now()
         
         if (useRaw) {
-          const res = await client.value!.uploadFileRaw({
-            path: uploadTargetPath,
-            filename: file.name,
-            content: chunkBlob, 
-            chunk_id: i,             
-            total_chunks: totalChunks 
+          // /api/fileraw 分块在 agent 端为幂等落盘（暂存覆盖写 + 按索引合并），失败可安全重试
+          await withRawChunkRetry(async () => {
+            const res = await client.value!.uploadFileRaw({
+              path: uploadTargetPath,
+              filename: file.name,
+              content: chunkBlob,
+              chunk_id: i,
+              total_chunks: totalChunks
+            });
+            if (!res || res.status !== 'ok') throw new Error(res?.message || `第 ${i+1} 块裸流分片传输失败`);
           });
-          if (!res || res.status !== 'ok') throw new Error(res?.message || `第 ${i+1} 块裸流分片传输失败`);
         } else {
           const base64Content = await readBlobAsBase64(chunkBlob)
           const res = await client.value!.uploadFile({

@@ -28,6 +28,12 @@ import { version as panelVersion } from '../package.json'; // 🏷️ 面板版�
 import { useToast } from './composables/useToast';
 const { toastState, showToast } = useToast();
 
+// 🔔 通知中心：公告 + toast 历史
+import NotificationCenter from './components/NotificationCenter.vue';
+import RecycleBin from './components/RecycleBin.vue';
+import { useNotificationCenter } from './composables/useNotificationCenter';
+const { addNotification } = useNotificationCenter();
+
 // 🔒 刚性对齐修改点：向下游依赖组件（如 Setting、FileManager）全面派发新版全局统一的 showToast 句柄
 provide('showToast', showToast);
 
@@ -185,6 +191,7 @@ const notification = ref<{ message: string; type: 'success' | 'error' | 'info' }
 // ⚡ 【重命名落地】：原有本地方网 showToast 改名为 showNotification，用于触发特定的独立右下角通知
 const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
   notification.value = { message, type };
+  addNotification({ kind: 'toast', type, message });
   setTimeout(() => notification.value = null, 3000);
 };
 provide('showNotification', showNotification);
@@ -453,9 +460,11 @@ const getTerminalWsUrl = (node: AgentNode) => {
   const path = useRandomPath ? generateRandomPath() : 'terminal';
 
   const isNodeHttps = node.domain.toLowerCase().startsWith('https://');
+  // 🔥 PHP 反代节点（域名带 #，已通过一次反代到达）不再接受第二次中转，强制直连
+  const isPhpProxyNode = node.domain.includes('#');
   // 🔥 即使配置了「中转全部站点（含 HTTPS）」，只要候选池只剩被访问节点自身（chosenProxy 为空），
   //    也强制回退为直连，绝不触发无意义的“自中转”
-  const finalShouldProxy = isProxyEnabled && !!chosenProxy && (shouldProxyAll || !isNodeHttps);
+  const finalShouldProxy = isProxyEnabled && !!chosenProxy && !isPhpProxyNode && (shouldProxyAll || !isNodeHttps);
 
   if (finalShouldProxy) {
     const proxyHost = chosenProxy.replace(/^https?:\/\//, '').replace(/\/+$/, '');
@@ -473,7 +482,7 @@ const getTerminalWsUrl = (node: AgentNode) => {
       <h1>
         <img src="/favicon.svg" alt="Kisama Logo" width="32" height="32" />
         Kisama
-        <span class="version-chip" :title="`面板版本 v${panelVersion}`">v{{ panelVersion }}</span>
+        <span class="version-chip" :title="`面板版本 ${panelVersion}`">{{ panelVersion }}</span>
       </h1>
       <div class="header-actions">
         <div class="action-group">
@@ -483,6 +492,8 @@ const getTerminalWsUrl = (node: AgentNode) => {
         </div>
 
         <div class="action-group">
+          <NotificationCenter />
+          <RecycleBin />
           <button class="btn secondary" :title="isDarkTheme ? '切换到浅色模式' : '切换到暗色模式'" @click="toggleTheme">
             {{ isDarkTheme ? '☀️' : '🌙' }}
           </button>
@@ -812,20 +823,18 @@ body {
   gap: 10px;
 }
 
-/* 🏷️ 标题旁的面板版本号角标（配色对齐 status-badge / domain-badge 的中性文字风格） */
+/* 🏷️ 标题旁的面板版本号（无角标样式，作为标题文字的一部分贴合显示） */
 .version-chip {
-  font-size: 0.75rem;
-  font-weight: 500;
+  font-size: 0.875rem;
+  font-weight: 400;
   letter-spacing: 0;
-  font-family: monospace;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: var(--surface-3);
-  border: 1px solid var(--border);
+  font-family: inherit;
   color: var(--muted);
   -webkit-text-fill-color: currentColor;
   cursor: default;
   white-space: nowrap;
+  vertical-align: baseline;
+  margin-left: -6px; /* 抵消 h1 flex 的 10px gap，让版本号紧贴标题文字 */
 }
 
 .header-actions {

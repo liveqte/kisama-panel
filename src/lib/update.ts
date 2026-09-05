@@ -1,5 +1,6 @@
 // src/lib/update.ts
 import { AgentClient } from './agent-client';
+import { getUploadChunkSize, withRawChunkRetry } from './upload-chunk';
 
 // ==================== 配置与常量定义 ====================
 const REPO = 'liveqte/Kisama_agent';
@@ -47,28 +48,6 @@ function isVersionGte30(versionStr: string): boolean {
   return false;
 }
 // ==================== 🛠️ 核心内部助手工具集 ====================
-
-/**
- * 💡 ✨【核心修复点 1】：自适应分块大小动态计算器
- * 开启中转时自动收缩至 512KB，确保数据常驻中转机物理内存，规避中转磁盘 I/O 阻塞；
- * 直连模式下自动恢复 2MB 满血带宽，全面绝杀中转域名下的 504 挂起超时。
- */
-function getAdaptiveChunkSize(): number {
-  try {
-    if (typeof window !== 'undefined') {
-      const proxyRaw = localStorage.getItem('kisama_proxy_config');
-      if (proxyRaw) {
-        const parsed = JSON.parse(proxyRaw);
-        if (parsed.enabled) {
-          return 512 * 1024; // 🔒 中转激活状态：刚性裁剪为 512KB 小包，秒进秒出
-        }
-      }
-    }
-  } catch (e) {
-    console.error('[Adaptive Chunk] 嗅探全局中转配置状态受限:', e);
-  }
-  return 2 * 1024 * 1024; // 🔓 正常直连状态：保持 2MB 高效分包
-}
 
 /**
  * 智能相对路径解构提取算法
@@ -136,7 +115,7 @@ async function uploadFileInChunks(
 ): Promise<void> {
   const totalSize = fileBlob.size;
   const { path, filename } = parsePathAndFilename(targetFullPath);
-  const currentChunkSize = getAdaptiveChunkSize(); 
+  const currentChunkSize = getUploadChunkSize();
 
   if (totalSize <= currentChunkSize) {
     // 【小文件闪传模式】
@@ -162,14 +141,16 @@ async function uploadFileInChunks(
       const segmentSize = end - start;
       
       if (useRaw) {
-        // 🚀 裸字节切片直接倾倒至 /api/fileraw
-        await client.uploadFileRaw({
-          path,
-          filename,
-          content: chunkBlob, // 1:1 纯净投递原始 Blob
-          chunk_id: i,
-          total_chunks: totalChunks
-        });
+        // 🚀 裸字节切片直接倾倒至 /api/fileraw（agent 端幂等落盘，失败可安全重试）
+        await withRawChunkRetry(() =>
+          client.uploadFileRaw({
+            path,
+            filename,
+            content: chunkBlob, // 1:1 纯净投递原始 Blob
+            chunk_id: i,
+            total_chunks: totalChunks
+          })
+        );
       } else {
         // 兼容老版本：切片转化为 Base64 字符串发送
         const base64Content = await readBlobAsBase64(chunkBlob);

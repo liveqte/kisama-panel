@@ -25,3 +25,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# ZCode session data
+.zcode/
+
+# Local-only files (do not track)
+UPDATE.md
+publish.ps1

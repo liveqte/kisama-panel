@@ -1,8 +1,10 @@
 <!-- src/components/NodeList.vue -->
 <script setup lang="ts">
+import { ref, computed } from 'vue';
 import { useNodes } from '../composables/useNodes';
 import NodeCard from './NodeCard.vue';
 import NodeTable from './NodeTable.vue';
+import DialogModal from './DialogModal.vue';
 
 const { nodes, filteredSortedNodes, viewMode, syncNodeBaseInfo, deleteNode, loading, searchQuery } = useNodes();
 
@@ -10,15 +12,37 @@ const handleRefresh = async (id: string) => {
   await syncNodeBaseInfo(id);
 };
 
+// 🗄️ 删除 = 移入回收站：用确认弹窗代替原生 confirm，与彻底删除一致
+const showDeleteConfirm = ref(false);
+const pendingDeleteId = ref<string | null>(null);
+const pendingDeleteName = computed(() =>
+  nodes.value.find(n => n.id === pendingDeleteId.value)?.name || ''
+);
+
 const handleDelete = (id: string) => {
-  if (confirm('确定删除此节点？')) {
-    deleteNode(id);
-  }
+  pendingDeleteId.value = id;
+  showDeleteConfirm.value = true;
+};
+
+const handleConfirmDelete = () => {
+  if (pendingDeleteId.value) deleteNode(pendingDeleteId.value);
+  showDeleteConfirm.value = false;
+  pendingDeleteId.value = null;
 };
 </script>
 
 <template>
   <div class="node-list">
+    <DialogModal
+      v-model="showDeleteConfirm"
+      title="移入回收站"
+      confirm-text="移入回收站"
+      @confirm="handleConfirmDelete"
+    >
+      <p>确定要将节点「{{ pendingDeleteName }}」移入回收站吗？</p>
+      <p style="font-size: 13px; color: var(--muted);">冻结期间不会触发任何后台任务（同步 / 脚本维护），可随时从回收站恢复。</p>
+    </DialogModal>
+
     <template v-if="filteredSortedNodes.length > 0">
       <TransitionGroup v-if="viewMode === 'card'" name="list" tag="div" class="list-container">
         <NodeCard

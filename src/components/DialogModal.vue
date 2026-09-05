@@ -57,7 +57,8 @@ function confirm() {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 2000;
+  /* 2200：需盖过通知/回收站抽屉（2100/2101），确认弹窗永远最顶层 */
+  z-index: 2200;
 }
 .dialog-content {
   background: var(--card);

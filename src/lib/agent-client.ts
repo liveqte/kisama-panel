@@ -183,14 +183,30 @@ export const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b93
 
 /**
  * 提取签名用的请求路径：不含 query string（含 /kisamaproxy 中转时也按原始 agent 路径签名，
- * 中转站按原始路径转发，agent 收到的即此 path）
+ * 中转站按原始路径转发，agent 收到的即此 path）。
+ * PHP 入口脚本转发形态（如 http://xx.xx/agent_froxlor.php/api/baseinfo）：
+ * 入口脚本名不参与 agent 端路由，agent 实际收到的是去掉脚本名后的路径，
+ * 因此签名前必须剔除该段，否则与 agent 端拼出的验签消息不一致。
+ * 入口脚本按 "首段 *.php" 通用匹配（agent_froxlor.php / agent_froxlor_ai_v2.php /
+ * agent_ai_v2.php 等任意入口名），不再硬编码单一文件名。
+ * 兜底：与 agent 端路径规范化一致 —— 剥离后仍不以 /api/ 开头时，取最后一个 "/api/"
+ * 锚点之后的路径（agent 全部路由为 /api/* 精确匹配，验签路径即此）。
  */
 function getSignPath(url: string): string {
+  const stripPhpEntry = (p: string): string =>
+    p.replace(/^\/[^/?#]+\.php(?=\/|$)/i, '') || '/';
+  let path: string;
   try {
-    return new URL(url).pathname || '/';
+    path = new URL(url).pathname;
   } catch {
-    return url.split('?')[0] || '/';
+    path = url.split('?')[0];
   }
+  path = stripPhpEntry(path);
+  if (!/^\/api(\/|$)/.test(path)) {
+    const anchor = path.lastIndexOf('/api/');
+    if (anchor >= 0) path = path.slice(anchor);
+  }
+  return path || '/';
 }
 
 /**
@@ -270,7 +286,8 @@ async function generateAuthHeaders(
  */
 export function computeWsDowngradeToken(sessionKeyB64: string): string {
   const raw = b64ToBytes(sessionKeyB64);
-  const mac = hmac(sha256, new TextEncoder().encode('kisama-ws-token-v1'), raw);
+  // @noble/hashes v2 的 hmac 签名是 (hash, key, message)：key 是 session_key 解码后的 32 字节
+  const mac = hmac(sha256, raw, new TextEncoder().encode('kisama-ws-token-v1'));
   return bytesToB64(mac);
 }
 
@@ -323,6 +340,8 @@ export interface AgentClientOptions {
 
 export class AgentClient {
   private readonly baseURL: string;
+  /** PHP 反代节点标记：域名形如 https://front.host/#target.host/k.php（带 #），已完成一次反代，不再接受第二层中转 */
+  private readonly isPhpProxyNode: boolean;
   private ecdsaSkPem?: string;
   private eciesSkPem?: string;
   private readonly defaultHeaders: Record<string, string>;
@@ -371,6 +390,7 @@ export class AgentClient {
       if (tPath) base += tPath;
     }
     this.baseURL = base;
+    this.isPhpProxyNode = options.domain.includes("#");
     this.eciesSkPem = options.eciesPrivateKey;
     this.ecdsaSkPem = options.ecdsaPrivateKey;
     this.timeout = options.timeout ?? 10_000;
@@ -404,6 +424,8 @@ export class AgentClient {
   private pickProxyTunnel(url: string): string | null {
     try {
       if (typeof window === 'undefined') return null;
+      // 🔥 PHP 反代节点（域名带 #，请求已通过 x-target-host 完成一次反代）不再接受第二次中转，强制直连
+      if (this.isPhpProxyNode) return null;
       const proxyRaw = localStorage.getItem('kisama_proxy_config');
       if (!proxyRaw) return null;
       const parsed = JSON.parse(proxyRaw);

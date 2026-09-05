@@ -1,4 +1,7 @@
 // src/lib/task-daemon.ts
+// 🗄️ 注意：本守护进程只遍历 useNodes().nodes（活跃节点）。
+// 回收站（agent_recycle_bin）中冻结的节点不在该列表中，因此永远不会
+// 触发这里的脚本任务维护、基础信息同步或任务恢复逻辑。
 import { useNodes } from '../composables/useNodes';
 import { probeProxyPoolHealth } from './proxy-health';
 import { AgentClient } from './agent-client';

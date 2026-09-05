@@ -1,5 +1,6 @@
 // src/composables/useToast.ts
 import { ref } from 'vue';
+import { useNotificationCenter } from './useNotificationCenter';
 
 export type ToastType = 'success' | 'error' | 'info';
 
@@ -17,6 +18,8 @@ const toastState = ref<ToastState>({
 });
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+const { addNotification } = useNotificationCenter();
 
 export function useToast() {
   /**
@@ -47,6 +50,9 @@ export function useToast() {
       if (typeof arg3 === 'number') duration = arg3;
       else if (typeof arg2 === 'number') duration = arg2;
     }
+
+    // 同步记入通知中心历史，避免一闪而过没看清
+    if (message) addNotification({ kind: 'toast', type, message });
 
     // 写入全局单例状态
     toastState.value = {

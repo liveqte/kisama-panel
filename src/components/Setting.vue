@@ -413,7 +413,7 @@ watch(() => globalForm.value.eciesPrivateKey, async (newVal) => {
               <div v-if="proxyEnabled" class="form-group checkbox-group" style="background:var(--card); padding:10px 14px; margin-top:-12px; margin-left: 24px; border-radius:10px; border:1px solid var(--border)">
                 <label class="checkbox-label" style="display:flex; align-items:center; gap:10px; cursor:pointer;">
                   <input type="checkbox" v-model="proxyAllSites" style="width:16px; height:16px; accent-color:var(--primary)" />
-                  <span class="checkbox-text" style="font-size:0.88rem; font-weight:500; color:var(--text);">中转全部站点（包括https节点）</span>
+                  <span class="checkbox-text" style="font-size:0.88rem; font-weight:500; color:var(--text);">中转全部站点（包括https节点，不包括php反代节点）</span>
                 </label>
               </div>
               <div v-if="proxyEnabled" class="proxy-settings-box" style="margin-top:16px; background:var(--surface-2); padding:16px; border-radius:14px; border:1px solid var(--border)">

@@ -33,7 +33,8 @@ interface TerminalTab {
   // ⚠️ LEGACY_AGENT_SUPPORT：以下协议兼容字段随旧版 agent 支持（面板 0.6.0）一起移除
   tokenScheme?: AgentProtoScheme;          // 本次连接使用的 token 方案
   wsTokenOverride?: AgentProtoScheme;      // 1008 降级探测后的强制方案（tab 生命周期内粘滞）
-  wsFallbackDone?: boolean;                // token 方案 1008 互换探测是否已用过（连接成功后复位）
+  wsFallbackDone?: boolean;                // token 方案 1008 互换探测是否已用过（收到服务端数据、认证确实通过后复位）
+  wsAuthVerified?: boolean;                // 本次连接是否收到过服务端数据（token 认证通过的实证）
   keyRotationRetried?: boolean;            // Noise 握手被拒后的密钥重拉重试是否已用过（握手成功后复位）
 }
 
@@ -548,6 +549,8 @@ const connectWebSocket = async (tab: TerminalTab) => {
 
     tab.ws = new WebSocket(wsUrl);
     tab.ws.binaryType = 'arraybuffer';
+    // 每次连接尝试重置认证实证哨兵，供 onclose 判断 1008 是否发生在认证通过前
+    tab.wsAuthVerified = false;
 
     tab.ws.onopen = async () => {
       if (tab.useNoise) {
@@ -567,8 +570,9 @@ const connectWebSocket = async (tab: TerminalTab) => {
       } else {
         tab.terminal.writeln('\x1b[1;32m✓ 终端通道已建立\x1b[0m');
         tab.connectionStatus = 'connected';
-        // 连接成功后复位一次性重试哨兵，后续断线仍可再触发一次降级探测
-        tab.wsFallbackDone = false;
+        // 注意：此处不复位 wsFallbackDone —— onopen 仅代表 WS 升级完成，
+        // token 认证被拒 (1008) 发生在这之后。哨兵只在真正收到服务端数据
+        // （onmessage，认证确实通过）后才复位，否则会形成 1008 无限互换探测。
         startHeartbeat();
         const resizePayload = JSON.stringify({ type: 'resize', cols: tab.terminal.cols, rows: tab.terminal.rows });
         const textEncoder = new TextEncoder();
@@ -578,6 +582,13 @@ const connectWebSocket = async (tab: TerminalTab) => {
     
     tab.ws.onmessage = (event) => {
       let dataToWrite: string | Uint8Array | null = null;
+
+      // 非加密模式下，收到任何服务端消息（含心跳）即证明 token 认证通过，
+      // 此时才复位 1008 降级探测哨兵，让后续真正的断线仍可再探测一次
+      if (!tab.useNoise && !tab.wsAuthVerified) {
+        tab.wsAuthVerified = true;
+        tab.wsFallbackDone = false;
+      }
 
       // ==================== 1. 加密状态下的解密与握手流程 ====================
       if (tab.useNoise) {
@@ -697,12 +708,21 @@ const connectWebSocket = async (tab: TerminalTab) => {
       // ⚠️ LEGACY_AGENT_SUPPORT：1008 token 降级探测（0.6.0 移除）。
       // agent 0.4.8 用 HMAC(session_key) token，旧版用 agent 公钥 token；
       // 被对方 1008 拒绝且未探测过时，切换 token 方案自动重连一次。
-      if (ev.code === 1008 && !tab.useNoise && !tab.wsFallbackDone) {
-        tab.wsFallbackDone = true;
-        tab.wsTokenOverride = tab.tokenScheme === 'v2' ? 'v1-legacy' : 'v2';
-        tab.terminal.writeln(`\r\n\x1b[1;33m⚠️ Token 认证被拒绝 (1008)，切换${tab.wsTokenOverride === 'v2' ? '新版 HMAC' : '旧版兼容'} token 方案自动重连...\x1b[0m`);
-        connectWebSocket(tab);
-        return;
+      // 若两种方案都未收到任何服务端数据即被拒（wsAuthVerified=false），
+      // 说明认证本身不可用，停止自动重连避免无限互换探测。
+      if (ev.code === 1008 && !tab.useNoise) {
+        if (!tab.wsFallbackDone) {
+          tab.wsFallbackDone = true;
+          tab.wsTokenOverride = tab.tokenScheme === 'v2' ? 'v1-legacy' : 'v2';
+          tab.terminal.writeln(`\r\n\x1b[1;33m⚠️ Token 认证被拒绝 (1008)，切换${tab.wsTokenOverride === 'v2' ? '新版 HMAC' : '旧版兼容'} token 方案自动重连...\x1b[0m`);
+          connectWebSocket(tab);
+          return;
+        }
+        if (!tab.wsAuthVerified) {
+          tab.terminal.writeln(`\r\n\x1b[1;31m✗ 两种 token 方案均被节点拒绝 (1008)，已停止自动重连。请确认面板与节点的 agent 版本是否匹配，或按 <Enter> 键手动重连。\x1b[0m`);
+          return;
+        }
+        // 走到这说明本次会话认证通过后才被 1008 断开：不自动探测，交给通用断线提示
       }
 
       // agent 0.4.8 密钥轮换恢复：Noise 握手完成前被服务端 close 1000，

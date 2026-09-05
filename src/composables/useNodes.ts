@@ -5,6 +5,7 @@ import { probeProxyPoolHealth } from '../lib/proxy-health';
 import { fetchIpMeta, fetchFlag, type IpType } from '../lib/check_iptype';
 import type { AgentNode } from '../types';
 import { nodeStableSignature } from '../lib/node-stable';
+import { useRecycleBin } from './useRecycleBin';
 
 /**
  * 单节点模式：传入 ipv4 与已持久化的 flag（node.flag），返回一个响应式 flag 状态
@@ -151,6 +152,9 @@ function saveGlobalConfig(config: GlobalConfig) {
 }
 
 export function useNodes() {
+
+  // 🗄️ 回收站（模块级单例，直接解构其操作函数）
+  const { moveToRecycleBin, removeFromRecycleBin } = useRecycleBin();
 
   // 加载节点配置
   const loadFromStorage = () => {
@@ -374,9 +378,23 @@ export function useNodes() {
     return true;
   };
 
+  // 🗄️ 删除即冻结：移入回收站（软删除），可随时从右侧抽屉恢复；
+  // 冻结节点不在 nodes 中，task-daemon 的轮询任务不会对其触发任何事件
   const deleteNode = (id: string) => {
+    const node = nodes.value.find(n => n.id === id);
+    if (node) moveToRecycleBin(node);
     nodes.value = nodes.value.filter(n => n.id !== id);
     saveToStorage();
+  };
+
+  // ♻️ 从回收站恢复节点（由 RecycleBin 组件与 takeFromRecycleBin 配对编排）
+  const restoreNode = (node: AgentNode): boolean => {
+    if (nodes.value.some(n => n.id === node.id)) return false;
+    const { deletedAt: _deletedAt, ...rest } = node as AgentNode & { deletedAt?: number };
+    // 置为离线，避免携带冻结前的陈旧在线状态造成假绿灯
+    nodes.value.push({ ...rest, status: 'offline', updatedAt: Date.now() });
+    saveToStorage();
+    return true;
   };
 
   // 计算属性 - 实时过滤和排序后的节点列表
@@ -517,6 +535,10 @@ export function useNodes() {
         }
       }
 
+      // 🗄️ 导入即视为恢复：导入成功的节点若此前被冻结在回收站中，
+      // 清除其冻结副本，防止同一节点同时存在于活跃列表与回收站
+      removeFromRecycleBin(importedNodes.filter(n => n.id && n.name && n.domain).map(n => n.id));
+
       saveToStorage();
       return { success, skipped };
     } catch (e: any) {
@@ -549,6 +571,7 @@ export function useNodes() {
     addNode,
     updateNode,
     deleteNode,
+    restoreNode,
     syncNodeBaseInfo,
     syncAllNodes,
     exportConfig,

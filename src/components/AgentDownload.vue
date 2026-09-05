@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, watch } from 'vue';
 import { zipSync, strToU8 } from 'fflate';
 import { inject } from 'vue';
 
@@ -27,7 +27,8 @@ const REMOTE_PATHS = ref({
   jsScript: '',
   packageJson: '',
   goBinary: '', // Go 二进制路径
-  javaJar: '' // Java jar包路径
+  javaJar: '', // Java 17 jar包路径
+  java11Jar: '' // Java 11 jar包路径
 });
 // 2. 将异步逻辑包装在函数中
 async function initVersion() {
@@ -47,7 +48,8 @@ async function initVersion() {
       jsScript: `${rawJs}/agent_obs.js`,
       packageJson: `${rawJs}/package.json`,
       goBinary: `${rawGo}/agent`, // 动态拼接 Go 二进制地址
-      javaJar: `${rawJava}/kisama-agent-java-0.1.0-obfuscated.jar` // Java 混淆包相对路径
+      javaJar: `${rawJava}/kisama-agent-java-0.1.0-obfuscated.jar`, // Java 17 混淆包相对路径
+      java11Jar: `${rawBase}/java11/target/kisama-agent-java-0.1.0-obfuscated.jar` // Java 11 混淆包相对路径
     };
     console.log("[DEBUG] 版本初始化成功:", latestTag);
   } catch (e) {
@@ -57,6 +59,7 @@ async function initVersion() {
 
 // 3. 在挂载后执行，这样 setup 函数本身是同步的
 onMounted(() => {
+  restoreKmodeConfig();
   initVersion();
 });
 
@@ -81,8 +84,90 @@ function toPythonUnicodeEscape(str: string): string {
   }).join('');
 }
 
+// ============ KMODE 隧道启动模式（agent 0.4.8+，Go 版不支持） ============
+const KMODE_STORAGE_KEY = 'kisama_kmode_config';
+
+const kmode = ref('0');   // '0' 关闭；'1' 隧道+域名文件+stdin；'2' 隧道+shz.al 静默上报
+const kpath = ref('');    // 模式1 域名文件路径，留空 = agent 默认 $HOME/domain.txt
+const kname = ref('');    // 模式2 shz.al 自定义名
+const knameKey = ref(''); // 模式2 管理密钥，留空 = agent 复用 KNAME
+
+// KNAME 规则：≥3 字符，限字母数字及 +_-[]*$=@,;/（agent 端不合法会静默退化为普通启动，必须前置拦截）
+const KNAME_PATTERN = /^[A-Za-z0-9+\-_\[\]*$=@,;/]{3,}$/;
+const knameValid = computed(() => kmode.value !== '2' || KNAME_PATTERN.test(kname.value.trim()));
+const kmodeInvalid = computed(() => !knameValid.value);
+
+// 模式2：控制端按约定 KNAME 直接计算上报查询地址（响应体即隧道域名，未上报时 404）
+const shzUrl = computed(() => kname.value.trim() ? `https://shz.al/~${kname.value.trim()}` : '');
+
+// 按模式生成需注入的环境变量；KMODE=0 或校验失败时返回空数组，产物与旧版完全一致
+const kmodeEnvEntries = computed(() => {
+  if (kmodeInvalid.value) return [];
+  if (kmode.value === '1') {
+    const entries = [{ key: 'KMODE', value: '1' }];
+    if (kpath.value.trim()) entries.push({ key: 'KPATH', value: kpath.value.trim() });
+    return entries;
+  }
+  if (kmode.value === '2') {
+    const entries = [{ key: 'KMODE', value: '2' }, { key: 'KNAME', value: kname.value.trim() }];
+    if (knameKey.value.trim()) entries.push({ key: 'KNAME_KEY', value: knameKey.value.trim() });
+    return entries;
+  }
+  return [];
+});
+
+function restoreKmodeConfig() {
+  try {
+    const saved = localStorage.getItem(KMODE_STORAGE_KEY);
+    if (!saved) return;
+    const cfg = JSON.parse(saved);
+    if (cfg.kmode === '1' || cfg.kmode === '2' || cfg.kmode === '0') kmode.value = cfg.kmode;
+    if (typeof cfg.kpath === 'string') kpath.value = cfg.kpath;
+    if (typeof cfg.kname === 'string') kname.value = cfg.kname;
+    if (typeof cfg.knameKey === 'string') knameKey.value = cfg.knameKey;
+  } catch (e) { /* 忽略损坏的本地配置 */ }
+}
+watch([kmode, kpath, kname, knameKey], () => {
+  localStorage.setItem(KMODE_STORAGE_KEY, JSON.stringify({
+    kmode: kmode.value, kpath: kpath.value, kname: kname.value, knameKey: knameKey.value
+  }));
+});
+
+// Node.js 文件头注入：剥掉源码中所有位置的 shebang（含意外粘在行中/行尾的），统一生成规范文件头
+// （shebang 必须在第 1 行，环境变量需在混淆代码执行前写入）。注意返回的是完整替换内容，不是前缀。
+function buildJsKmodeContent(entries: { key: string; value: string }[], scriptContent: string): string {
+  if (!entries.length) return '';
+  const shebang = '#!/usr/bin/env node';
+  let body = scriptContent.replace(new RegExp('^' + shebang + '[^\\S\\n]*\\n?'), '');
+  body = body.replace(new RegExp('\\n' + shebang, 'g'), '\n');
+  body = body.replace(new RegExp('\\};\\s*' + shebang, 'g'), '};');
+  body = body.replace(/^\n+/, '');
+  const block = entries.map(e => `process.env[${JSON.stringify(e.key)}]=${JSON.stringify(e.value)};`).join('') + '\n';
+  return shebang + '\n' + block + body;
+}
+
+// Python 文件头前置；若源码以 shebang 开头则插到第一行之后
+function buildPyKmodePrefix(entries: { key: string; value: string }[], scriptContent: string): string {
+  if (!entries.length) return '';
+  const block = [
+    'import os as _os',
+    ...entries.map(e => `_os.environ[${JSON.stringify(e.key)}] = ${JSON.stringify(e.value)}`)
+  ].join('\n') + '\n';
+  if (scriptContent.startsWith('#!')) {
+    const nl = scriptContent.indexOf('\n');
+    return nl === -1 ? scriptContent + '\n' + block : scriptContent.slice(0, nl + 1) + block + scriptContent.slice(nl + 1);
+  }
+  return block + scriptContent;
+}
+
+// Java 定制包不再单独打包 keys/ 目录，公钥随 KMODE 一并写入 .env
+
 // 默认激活 Node.js 标签页
 const activeTab = ref('nodejs'); 
+
+// Java 子版本标签：17 / 11（仅 jar 下载地址目录不同，其余逻辑一致）
+const javaSubTab = ref('17');
+const activeJavaJar = computed(() => javaSubTab.value === '11' ? REMOTE_PATHS.value.java11Jar : REMOTE_PATHS.value.javaJar);
 
 const props = defineProps<{
   globalConfig: {
@@ -212,10 +297,10 @@ const goCopyCmd = computed(() => {
 const javaDeployCmd = computed(() => {
   const ecdsa = compressedEcdsaB64.value || '/* 请先在设置中配置 ECDSA 公钥 */';
   const ecies = props.globalConfig.eciesPublicKey || '/* 请先在设置中配置 ECIES 公钥 */';
-  return `curl -Lo server.jar ${REMOTE_PATHS.value.javaJar}\nexport ECDSA_PUBKEY="${ecdsa}"\nexport ECIES_PUBKEY="${ecies}"\nexport KPORT=8000\njava -jar server.jar`;
+  return `curl -Lo server.jar ${activeJavaJar.value}\nexport ECDSA_PUBKEY="${ecdsa}"\nexport ECIES_PUBKEY="${ecies}"\nexport KPORT=8000\njava -jar server.jar`;
 });
 const javaCopyCmd = computed(() => {
-  return `curl -Lo server.jar ${REMOTE_PATHS.value.javaJar}\nexport ECDSA_PUBKEY="${compressedEcdsaB64.value || ''}"\nexport ECIES_PUBKEY="${props.globalConfig.eciesPublicKey || ''}"\nexport KPORT=8000\njava -jar server.jar`;
+  return `curl -Lo server.jar ${activeJavaJar.value}\nexport ECDSA_PUBKEY="${compressedEcdsaB64.value || ''}"\nexport ECIES_PUBKEY="${props.globalConfig.eciesPublicKey || ''}"\nexport KPORT=8000\njava -jar server.jar`;
 });
 
 // 🐳 Docker 方式一：一键命令模板
@@ -250,6 +335,9 @@ const handleDownloadNodejs = async () => {
     scriptContent = scriptContent.replace(JS_PLACEHOLDER_REGEX.ECDSA, JSON.stringify(ecdsaPublicKey));
     scriptContent = scriptContent.replace(JS_PLACEHOLDER_REGEX.ECIES, JSON.stringify(eciesPublicKey));
 
+    const jsKmodeContent = buildJsKmodeContent(kmodeEnvEntries.value, scriptContent);
+    if (jsKmodeContent) scriptContent = jsKmodeContent;
+
     const zipData = {
       'index.js': strToU8(scriptContent), 
       'package.json': strToU8(pkgContent)
@@ -267,7 +355,7 @@ const handleDownloadNodejs = async () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     
-    showNotification('✅ Node.js 定制包下载成功！', 'success');
+    showNotification('✅ Node.js 定制包下载成功！' + (kmodeEnvEntries.value.length ? `（已注入 KMODE=${kmode.value}）` : ''), 'success');
   } catch (err) {
     console.error('Node.js 下载失败:', err);
     showNotification('❌ 获取远程文件失败', 'error');
@@ -304,6 +392,8 @@ const handleDownloadPython = async () => {
       scriptContent = scriptContent.replace(PY_PLACEHOLDER_REGEX.ECIES, replacement);
     }
 
+    scriptContent = buildPyKmodePrefix(kmodeEnvEntries.value, scriptContent);
+
     const zipData = {
       'main.py': strToU8(scriptContent), 
       'requirements.txt': strToU8(reqContent)
@@ -321,7 +411,7 @@ const handleDownloadPython = async () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     
-    showNotification('✅ Python 定制包下载成功！', 'success');
+    showNotification('✅ Python 定制包下载成功！' + (kmodeEnvEntries.value.length ? `（已注入 KMODE=${kmode.value}）` : ''), 'success');
   } catch (err) {
     console.error('Python 下载失败:', err);
     showNotification('❌ 获取远程文件失败', 'error');
@@ -377,16 +467,21 @@ const handleDownloadJava = async () => {
   }
   showNotification('🔄 正在生成定制版 Java 代理包...', 'info');
   try {
-    const javaRes = await fetch(REMOTE_PATHS.value.javaJar);
+    const javaRes = await fetch(activeJavaJar.value);
     if (!javaRes.ok) throw new Error(`Java 程序包获取失败: ${javaRes.status}`);
 
     const javaBuffer = await javaRes.arrayBuffer();
     const javaJarUint8 = new Uint8Array(javaBuffer);
 
+    // 公钥与 KMODE 全部通过 .env 注入（与方式二命令行环境变量同格式；ECDSA 为 33 字节压缩 Base64）
+    const envLines = [
+      ...kmodeEnvEntries.value.map(e => `${e.key}=${e.value}`),
+      `ECDSA_PUBKEY=${compressedEcdsaB64.value}`,
+      `ECIES_PUBKEY=${eciesPublicKey}`
+    ];
     const zipData = {
       'server.jar': javaJarUint8, 
-      'keys/agent_ecdsa_pub.pem': strToU8(ecdsaPublicKey),
-      'keys/agent_ecies_pub.b64': strToU8(eciesPublicKey)
+      '.env': strToU8(envLines.join('\n') + '\n')
     };
 
     const zipped = zipSync(zipData);
@@ -395,13 +490,13 @@ const handleDownloadJava = async () => {
     
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'kisama_agent_java.zip';
+    a.download = javaSubTab.value === '11' ? 'kisama_agent_java11.zip' : 'kisama_agent_java.zip';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     
-    showNotification('✅ Java 定制版配置压缩包下载成功！', 'success');
+    showNotification('✅ Java 定制版配置压缩包下载成功！' + (kmodeEnvEntries.value.length ? `（已注入 KMODE=${kmode.value}）` : ''), 'success');
   } catch (err) {
     console.error('Java 下载打包失败:', err);
     showNotification('❌ 获取远程 Jar 文件或打包失败', 'error');
@@ -467,6 +562,43 @@ const copyCommand = (cmd: string) => {
           </button>
         </div>
 
+        <div v-if="['nodejs', 'python', 'java'].includes(activeTab)" class="kmode-section">
+          <div class="section-header">
+            <h4>🛣️ KMODE 隧道启动模式 <span class="kmode-badge">0.4.8+</span></h4>
+            <p class="desc">目标机器无公网端口/域名（NAT 后、翼龙容器等）时，可让 agent 经 trycloudflare 临时隧道上线。配置将随方式一定制包自动写入。</p>
+          </div>
+          <div class="kmode-options">
+            <label class="kmode-option"><input type="radio" value="0" v-model="kmode" /> 关闭 (默认)</label>
+            <label class="kmode-option"><input type="radio" value="1" v-model="kmode" /> 模式1：域名文件 + stdin 指令</label>
+            <label class="kmode-option"><input type="radio" value="2" v-model="kmode" /> 模式2：shz.al 静默上报</label>
+          </div>
+          <div v-if="kmode === '1'" class="kmode-fields">
+            <label class="kmode-field">
+              <span>KPATH 域名文件路径（选填，缺省 $HOME/domain.txt）:</span>
+              <input type="text" v-model="kpath" placeholder="$HOME/domain.txt" spellcheck="false" />
+            </label>
+          </div>
+          <div v-if="kmode === '2'" class="kmode-fields">
+            <label class="kmode-field">
+              <span>KNAME shz.al 自定义名（必填，≥3 字符）:</span>
+              <input type="text" v-model="kname" placeholder="env01a" spellcheck="false" />
+            </label>
+            <label class="kmode-field">
+              <span>KNAME_KEY 上报管理密钥（选填，缺省复用 KNAME）:</span>
+              <input type="text" v-model="knameKey" placeholder="留空则复用 KNAME" spellcheck="false" />
+            </label>
+            <div v-if="knameValid && shzUrl" class="kmode-url">
+              <div class="kmode-url-row">
+                <span>上报域名查询地址:</span>
+                <a :href="shzUrl" target="_blank" rel="noopener" class="link">{{ shzUrl }}</a>
+                <button class="btn secondary btn-sm" @click="copyCommand(shzUrl)">复制</button>
+              </div>
+              <p class="kmode-url-hint">agent 部署并上报前访问返回 404，轮询至 200 后响应体即隧道域名；agent 每次重启自动覆盖更新，上报值 7 天后过期。</p>
+            </div>
+            <p v-if="!knameValid" class="kmode-error">❌ KNAME 不合法：需 ≥3 字符，仅限字母数字及 +_-[]*$=@,;/</p>
+          </div>
+        </div>
+
         <div class="modal-body">
           
           <div v-if="activeTab === 'nodejs'" class="tab-pane">
@@ -495,7 +627,7 @@ const copyCommand = (cmd: string) => {
               <button 
                 class="btn primary full-width" 
                 @click="handleDownloadNodejs"
-                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey"
+                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey || kmodeInvalid"
               >
                 📥 生成并下载 Node.js 定制包 (.zip)
               </button>
@@ -571,12 +703,13 @@ const copyCommand = (cmd: string) => {
               <button 
                 class="btn primary full-width" 
                 @click="handleDownloadPython"
-                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey"
+                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey || kmodeInvalid"
               >
                 📥 生成并下载 Python 定制包 (.zip)
               </button>
             </div>
 
+            <!-- ⚠️ 方式二（pip 一键启动）与方式三（依赖模块嵌入）暂时失效，先下架；恢复时取消本段注释
             <hr class="divider" />
 
             <div class="download-section">
@@ -602,6 +735,7 @@ const copyCommand = (cmd: string) => {
                 <button class="btn secondary btn-sm copy-btn" @click="copyCommand(pyEmbedCode)">复制脚本</button>
               </div>
             </div>
+            -->
 
             <hr class="divider" />
 
@@ -622,6 +756,7 @@ const copyCommand = (cmd: string) => {
               <div class="section-header">
                 <h4>📄 运行说明</h4>
                 <p class="desc">下载解压或给二进制赋予可执行权限后，直接运行启动服务即可。</p>
+                <p class="desc">ℹ️ Go 版暂不支持 KMODE 隧道启动模式，设置不产生任何效果。</p>
               </div>
               <div class="flex-actions">
                 <div class="code-inline" style="text-align: center;">
@@ -671,10 +806,14 @@ const copyCommand = (cmd: string) => {
           </div>
 
           <div v-if="activeTab === 'java'" class="tab-pane">
+            <div class="subtabs-nav">
+              <button class="subtab-btn" :class="{ active: javaSubTab === '17' }" @click="javaSubTab = '17'">Java 17</button>
+              <button class="subtab-btn" :class="{ active: javaSubTab === '11' }" @click="javaSubTab = '11'">Java 11</button>
+            </div>
             <div class="download-section">
               <div class="section-header">
                 <h4>📄 运行说明</h4>
-                <p class="desc">确保系统已安装 Java 8 或更高版本，使用 Jar 命令启动服务。</p>
+                <p class="desc">确保系统已安装 Java {{ javaSubTab === '11' ? '11' : '17' }} 或更高版本，使用 Jar 命令启动服务。</p>
               </div>
               <div class="flex-actions">
                 <div class="code-inline" style="text-align: center;">
@@ -688,7 +827,7 @@ const copyCommand = (cmd: string) => {
             <div class="download-section">
               <div class="section-header">
                 <h4>📦 方式一：下载部署压缩包 (推荐)</h4>
-                <p class="desc">自动打包混淆版 <code>server.jar</code> 核心实体，并建立 <code>keys/</code> 专属公钥目录结构，开箱即用。</p>
+                <p class="desc">自动打包混淆版 <code>server.jar</code>，公钥（ECDSA 为 33 字节压缩 Base64）与 KMODE 一并写入 <code>.env</code>，需与 server.jar 同目录启动。</p>
               </div>
               
               <div class="key-status">
@@ -703,7 +842,7 @@ const copyCommand = (cmd: string) => {
               <button 
                 class="btn primary full-width" 
                 @click="handleDownloadJava"
-                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey"
+                :disabled="!props.globalConfig.ecdsaPublicKey || !props.globalConfig.eciesPublicKey || kmodeInvalid"
               >
                 📥 生成并下载 Java 定制包 (.zip)
               </button>
@@ -855,6 +994,30 @@ const copyCommand = (cmd: string) => {
   background: var(--btn-bg); /* 激活时背景高亮，增加区分度 */
 }
 
+/* --- Java 子版本标签 --- */
+.subtabs-nav {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.subtab-btn {
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface-2);
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+  transition: all 0.2s;
+}
+.subtab-btn:hover { color: var(--primary); border-color: var(--primary); }
+.subtab-btn.active {
+  color: var(--primary);
+  font-weight: 600;
+  border-color: var(--primary);
+  background: var(--btn-bg);
+}
+
 /* --- 其他原有样式 --- */
 .download-section { margin-bottom: 24px; }
 .section-header h4 { margin: 0 0 4px 0; color: var(--text); }
@@ -917,6 +1080,62 @@ const copyCommand = (cmd: string) => {
   .tab-btn { font-size: 0.8rem; padding: 12px 2px; }
 }
 .flex-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+/* --- KMODE 隧道配置区 --- */
+.kmode-section {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 12px 16px 0;
+}
+.kmode-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--primary);
+  border: 1px solid var(--primary);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.kmode-options { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+.kmode-option {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 0.85rem; color: var(--text); cursor: pointer;
+}
+.kmode-fields { display: flex; flex-direction: column; gap: 8px; }
+.kmode-field { display: flex; flex-direction: column; gap: 2px; font-size: 0.8rem; color: var(--muted); }
+.kmode-field input {
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 0.85rem;
+  font-family: monospace;
+}
+.kmode-field input:focus { outline: none; border-color: var(--primary); }
+.kmode-error { color: #dc2626; font-size: 0.8rem; margin: 0; font-weight: 600; }
+.kmode-url {
+  background: var(--surface-3);
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+.kmode-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.kmode-url-row .link { word-break: break-all; font-family: monospace; }
+.kmode-url-hint { font-size: 0.75rem; color: var(--muted); margin: 6px 0 0; }
+@media (max-width: 480px) {
+  .kmode-section { margin: 12px 8px 0; }
+  .kmode-options { flex-direction: column; gap: 6px; }
+}
  .code-inline {
   background: var(--surface-3);
   color: var(--text-soft);

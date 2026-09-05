@@ -58,6 +58,7 @@
 
 import { createWebDavClient, loadWebDavConfig, type WebDavClient } from './webdav';
 import { useNodes } from '../composables/useNodes';
+import { useRecycleBin } from '../composables/useRecycleBin';
 import { injectCustomStyle, injectCustomScript } from './runtime-inject';
 import { nodeStableSignature } from './node-stable';
 import { reportWebDavLink } from './webdav-status';
@@ -79,6 +80,8 @@ export const REMOTE_BACKUP_FILE = 'kisama.backup.json';
  */
 const BUNDLE_EXCLUDED_KEYS = [
   'agent_nodes_config',
+  // 🗄️ 回收站单独走顶层 recycleBin 字段（按 id 并集合并，而非整包覆盖）
+  'agent_recycle_bin',
   'kisama_proxy_config',
   'kisama_status_page_config',
   'kisama_custom_style',
@@ -99,6 +102,7 @@ const BUNDLE_EXCLUDED_KEYS = [
  */
 export const buildFullBackupBundle = (options: { forCloudSync?: boolean } = {}) => {
   const { exportConfig } = useNodes();
+  const { recycledNodes } = useRecycleBin();
   const excludedKeys = options.forCloudSync
     ? [...BUNDLE_EXCLUDED_KEYS, 'kisama_webdav_config']
     : BUNDLE_EXCLUDED_KEYS;
@@ -116,8 +120,10 @@ export const buildFullBackupBundle = (options: { forCloudSync?: boolean } = {}) 
 
   return {
     dataType: 'kisama_full_backup' as const,
-    version: '1.1.0',
+    version: '1.2.0',
     nodes: JSON.parse(exportConfig()),
+    // 🗄️ 回收站（冻结节点）：旧版本面板导入时会忽略此未知字段，天然向后兼容
+    recycleBin: JSON.parse(JSON.stringify(recycledNodes.value)),
     globalSettings: {
       proxy: JSON.parse(localStorage.getItem('kisama_proxy_config') || 'null'),
       statusPage: JSON.parse(localStorage.getItem('kisama_status_page_config') || 'null'),
@@ -135,8 +141,18 @@ export const buildFullBackupBundle = (options: { forCloudSync?: boolean } = {}) 
  */
 export const applyFullBackupBundle = (json: any, options: { fromCloudSync?: boolean } = {}) => {
   const { importConfig } = useNodes();
+  const { mergeRecycleBin } = useRecycleBin();
   // 1. 还原节点资产
   importConfig(JSON.stringify(json.nodes));
+
+  // 1.5 🗄️ 合并回收站（冻结节点）：按 id 并集、deletedAt 新者胜，
+  //     不整包覆盖本机；旧版备份包无 recycleBin 字段则完全不动本地回收站。
+  //     已存在于活跃列表的 id 不并入，保证「活跃/冻结不共存」不变量
+  if (Array.isArray(json.recycleBin)) {
+    const { nodes } = useNodes();
+    const activeIds = new Set(nodes.value.map(n => n.id));
+    mergeRecycleBin(json.recycleBin.filter((n: any) => n?.id && !activeIds.has(n.id)));
+  }
 
   const gs = json.globalSettings || {};
 
@@ -399,11 +415,20 @@ async function runConfigSyncCore(options: ConfigSyncOptions = {}): Promise<Confi
     // 域 1 合并：节点并集
     const mergedNodes = mergeNodesById(nodesListOf(localBundle), nodesListOf(remoteBundle));
 
+    // 域 1.5 🗄️ 回收站并集：双方冻结条目按 id 收拢（去重与「活跃不共存」过滤
+    //     由 applyFullBackupBundle 内的 mergeRecycleBin 完成）。
+    //     与节点域同为并集语义：彻底删除不传播，恢复经活跃列表正常漫游
+    const mergedRecycleBin = [
+      ...((localBundle.recycleBin as any[]) || []),
+      ...((remoteBundle.recycleBin as any[]) || []),
+    ];
+
     // 先应用到本地（importConfig 会原样保留未变化的节点，仅对新增/变化节点刷新时间戳）
     applyFullBackupBundle({
       dataType: 'kisama_full_backup',
       version: winner.version ?? '1.1.0',
       nodes: { ...(winner.nodes || {}), nodes: mergedNodes },
+      recycleBin: mergedRecycleBin,
       globalSettings: winner.globalSettings,
     }, { fromCloudSync: true });
 
